@@ -17,6 +17,7 @@ from keras.callbacks import TensorBoard, ModelCheckpoint, EarlyStopping
 from yad2k.models.keras_yolo import (preprocess_true_boxes, yolo_body,
                                      yolo_eval, yolo_head, yolo_loss)
 from yad2k.utils.draw_boxes import draw_boxes
+import scipy.misc
 
 # Args
 argparser = argparse.ArgumentParser(
@@ -45,6 +46,35 @@ YOLO_ANCHORS = np.array(
     ((0.57273, 0.677385), (1.87446, 2.06253), (3.33843, 5.47434),
      (7.88282, 3.52778), (9.77052, 9.16828)))
 
+YOLO_RES = (608, 608)
+
+def data_generator(args, anchors, batch_size):
+    file_name = os.path.expanduser(args.data_path)
+    with open(file_name, 'r') as f:
+        data = f.readlines()
+    current_idx = 0
+    total = len(data)
+    while True:
+        if current_idx+batch_size < total:
+            size = batch_size
+        else:
+            size = (total - current_idx)
+
+        batch_images = np.zeros((size, 2592, 1944, 3))
+        batch_boxes = []
+        for i in range(size):
+            image_file = data[i+current_idx].strip()
+            label_file = '/'.join(image_file.split('/')[:-2] + ['labels', image_file.split('/')[-1][:-3]+'txt'])
+            batch_images[i] = scipy.misc.imread(image_file)
+            with open(label_file, 'r') as f:
+                lbls = f.readlines()
+                batch_boxes.append([line.strip().split(' ') for line in lbls])
+
+        image_data, boxes = process_data(batch_images, batch_boxes)
+        detectors_mask, matching_true_boxes = get_detector_mask(boxes, anchors)
+
+        yield [image_data, boxes, detectors_mask, matching_true_boxes], np.zeros(size)
+
 def _main(args):
     data_path = os.path.expanduser(args.data_path)
     classes_path = os.path.expanduser(args.classes_path)
@@ -53,26 +83,24 @@ def _main(args):
     class_names = get_classes(classes_path)
     anchors = get_anchors(anchors_path)
 
-    data = np.load(data_path) # custom data saved as a numpy file.
+    # custom data saved as a numpy file.
     #  has 2 arrays: an object array 'boxes' (variable length of boxes in each image)
     #  and an array of images 'images'
 
-    image_data, boxes = process_data(data['images'], data['boxes'])
-
     anchors = YOLO_ANCHORS
 
-    detectors_mask, matching_true_boxes = get_detector_mask(boxes, anchors)
-
     model_body, model = create_model(anchors, class_names)
+
+    with open(data_path, 'r') as f:
+        dat = f.readlines()
+        data_size = len(dat)
 
     train(
         model,
         class_names,
         anchors,
-        image_data,
-        boxes,
-        detectors_mask,
-        matching_true_boxes
+        args,
+        data_size
     )
 
     draw(model_body,
@@ -104,19 +132,19 @@ def get_anchors(anchors_path):
 
 def process_data(images, boxes=None):
     '''processes the data'''
-    images = [PIL.Image.fromarray(i) for i in images]
+    images = [scipy.misc.toimage(i) for i in images]
     orig_size = np.array([images[0].width, images[0].height])
     orig_size = np.expand_dims(orig_size, axis=0)
 
     # Image preprocessing.
-    processed_images = [i.resize((416, 416), PIL.Image.BICUBIC) for i in images]
+    processed_images = [i.resize(YOLO_RES, PIL.Image.BICUBIC) for i in images]
     processed_images = [np.array(image, dtype=np.float) for image in processed_images]
     processed_images = [image/255. for image in processed_images]
 
     if boxes is not None:
         # Box preprocessing.
         # Original boxes stored as 1D list of class, x_min, y_min, x_max, y_max.
-        boxes = [box.reshape((-1, 5)) for box in boxes]
+        boxes = [np.array(box, dtype=np.float32).reshape((-1, 5)) for box in boxes]
         # Get extents as y_min, x_min, y_max, x_max, class for comparision with
         # model output.
         boxes_extents = [box[:, [2, 1, 4, 3, 0]] for box in boxes]
@@ -155,7 +183,7 @@ def get_detector_mask(boxes, anchors):
     detectors_mask = [0 for i in range(len(boxes))]
     matching_true_boxes = [0 for i in range(len(boxes))]
     for i, box in enumerate(boxes):
-        detectors_mask[i], matching_true_boxes[i] = preprocess_true_boxes(box, anchors, [416, 416])
+        detectors_mask[i], matching_true_boxes[i] = preprocess_true_boxes(box, anchors, list(YOLO_RES))
 
     return np.array(detectors_mask), np.array(matching_true_boxes)
 
@@ -177,15 +205,16 @@ def create_model(anchors, class_names, load_pretrained=True, freeze_body=True):
 
     '''
 
-    detectors_mask_shape = (13, 13, 5, 1)
-    matching_boxes_shape = (13, 13, 5, 5)
+    detectors_mask_shape = (19, 19, 5, 1)
+    matching_boxes_shape = (19, 19, 5, 5)
 
     # Create model input layers.
-    image_input = Input(shape=(416, 416, 3))
+    image_input = Input(shape=YOLO_RES + (3,))
     boxes_input = Input(shape=(None, 5))
     detectors_mask_input = Input(shape=detectors_mask_shape)
     matching_boxes_input = Input(shape=matching_boxes_shape)
 
+    """
     # Create model body.
     yolo_model = yolo_body(image_input, len(anchors), len(class_names))
     topless_yolo = Model(yolo_model.input, yolo_model.layers[-2].output)
@@ -200,13 +229,21 @@ def create_model(anchors, class_names, load_pretrained=True, freeze_body=True):
             model_body = Model(model_body.inputs, model_body.layers[-2].output)
             model_body.save_weights(topless_yolo_path)
         topless_yolo.load_weights(topless_yolo_path)
-
+    """
+    if load_pretrained:
+        yolo_path = os.path.join('model_data', 'yolo.h5')
+        model_body = load_model(yolo_path)
+        topless_yolo = Model(model_body.inputs, model_body.layers[-2].output)
+    else:
+        yolo_model = yolo_body(image_input, len(anchors), len(class_names))
+        topless_yolo = Model(yolo_model.input, yolo_model.layers[-2].output)
+    
     if freeze_body:
         for layer in topless_yolo.layers:
             layer.trainable = False
-    final_layer = Conv2D(len(anchors)*(5+len(class_names)), (1, 1), activation='linear')(topless_yolo.output)
+    final_layer = Conv2D(len(anchors)*(5+len(class_names)), 1, 1, activation='linear', name='conv_final')(topless_yolo.output)
 
-    model_body = Model(image_input, final_layer)
+    model_body = Model(topless_yolo.input, final_layer)
 
     # Place model loss on CPU to reduce GPU memory usage.
     with tf.device('/cpu:0'):
@@ -227,7 +264,7 @@ def create_model(anchors, class_names, load_pretrained=True, freeze_body=True):
 
     return model_body, model
 
-def train(model, class_names, anchors, image_data, boxes, detectors_mask, matching_true_boxes, validation_split=0.1):
+def train(model, class_names, anchors, args, data_size, validation_split=0.1):
     '''
     retrain/fine-tune the model
 
@@ -248,11 +285,10 @@ def train(model, class_names, anchors, image_data, boxes, detectors_mask, matchi
                                  save_weights_only=True, save_best_only=True)
     early_stopping = EarlyStopping(monitor='val_loss', min_delta=0, patience=15, verbose=1, mode='auto')
 
-    model.fit([image_data, boxes, detectors_mask, matching_true_boxes],
-              np.zeros(len(image_data)),
-              validation_split=validation_split,
-              batch_size=32,
-              epochs=5,
+    model.fit_generator(data_generator(args, anchors, 32),
+              #validation_split=validation_split,
+              nb_epoch=5,
+              samples_per_epoch=data_size,
               callbacks=[logging])
     model.save_weights('trained_stage_1.h5')
 
@@ -266,20 +302,18 @@ def train(model, class_names, anchors, image_data, boxes, detectors_mask, matchi
         })  # This is a hack to use the custom loss function in the last layer.
 
 
-    model.fit([image_data, boxes, detectors_mask, matching_true_boxes],
-              np.zeros(len(image_data)),
-              validation_split=0.1,
-              batch_size=8,
-              epochs=30,
+    model.fit_generator(data_generator(args, anchors, 8),
+              #validation_split=0.1,
+              nb_epoch=30,
+              samples_per_epoch=data_size,
               callbacks=[logging])
 
     model.save_weights('trained_stage_2.h5')
 
-    model.fit([image_data, boxes, detectors_mask, matching_true_boxes],
-              np.zeros(len(image_data)),
-              validation_split=0.1,
-              batch_size=8,
-              epochs=30,
+    model.fit_generator(data_generator(args, anchors, 8),
+              #validation_split=0.1,
+              nb_epoch=30,
+              samples_per_epoch=data_size,
               callbacks=[logging, checkpoint, early_stopping])
 
     model.save_weights('trained_stage_3.h5')

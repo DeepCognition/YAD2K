@@ -111,6 +111,7 @@ def _main(args):
     boxes, scores, classes = yolo_eval(
         yolo_outputs,
         input_image_shape,
+        max_boxes=30,
         score_threshold=args.score_threshold,
         iou_threshold=args.iou_threshold)
 
@@ -169,6 +170,8 @@ def _main(args):
             bottom = min(image.size[1], np.floor(bottom + 0.5).astype('int32'))
             right = min(image.size[0], np.floor(right + 0.5).astype('int32'))
             print(label, (left, top), (right, bottom))
+            with open('results.txt', 'a') as f:
+                f.write(label.split(' ')[0] + ',' + str(left) + ',' + str(top) + ',' + str(right) + ',' + str(bottom) + '\n')
 
             if top - label_size[1] >= 0:
                 text_origin = np.array([left, top - label_size[1]])

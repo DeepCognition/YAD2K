@@ -4,8 +4,7 @@ import sys
 import numpy as np
 import tensorflow as tf
 from keras import backend as K
-from keras.layers import Lambda
-from keras.layers.merge import concatenate
+from keras.layers import Lambda, Reshape, merge
 from keras.models import Model
 
 from ..utils import compose
@@ -45,21 +44,21 @@ def space_to_depth_x2_output_shape(input_shape):
 def yolo_body(inputs, num_anchors, num_classes):
     """Create YOLO_V2 model CNN body in Keras."""
     darknet = Model(inputs, darknet_body()(inputs))
+    conv13 = darknet.get_layer('batchnormalization_13').output
     conv20 = compose(
-        DarknetConv2D_BN_Leaky(1024, (3, 3)),
-        DarknetConv2D_BN_Leaky(1024, (3, 3)))(darknet.output)
+        DarknetConv2D_BN_Leaky(1024, 3, 3),
+        DarknetConv2D_BN_Leaky(1024, 3, 3))(darknet.output)
 
-    conv13 = darknet.layers[43].output
-    conv21 = DarknetConv2D_BN_Leaky(64, (1, 1))(conv13)
     # TODO: Allow Keras Lambda to use func arguments for output_shape?
-    conv21_reshaped = Lambda(
+    conv13_reshaped = Lambda(
         space_to_depth_x2,
         output_shape=space_to_depth_x2_output_shape,
-        name='space_to_depth')(conv21)
+        name='space_to_depth')(conv13)
 
-    x = concatenate([conv21_reshaped, conv20])
-    x = DarknetConv2D_BN_Leaky(1024, (3, 3))(x)
-    x = DarknetConv2D(num_anchors * (num_classes + 5), (1, 1))(x)
+    # Concat conv13 with conv20.
+    x = merge([conv13_reshaped, conv20], mode='concat')
+    x = DarknetConv2D_BN_Leaky(1024, 3, 3)(x)
+    x = DarknetConv2D(num_anchors * (num_classes + 5), 1, 1)(x)
     return Model(inputs, x)
 
 
@@ -124,7 +123,7 @@ def yolo_head(feats, anchors, num_classes):
     #     (conv_dims[0], conv_dims[1], num_anchors, num_classes + 5))(feats)
 
     box_xy = K.sigmoid(feats[..., :2])
-    box_wh = K.exp(feats[..., 2:4])
+    box_wh = (K.exp(feats[..., 2:4]) + K.sigmoid(feats[..., 2:4]))/2
     box_confidence = K.sigmoid(feats[..., 4:5])
     box_class_probs = K.softmax(feats[..., 5:])
 
@@ -149,11 +148,7 @@ def yolo_boxes_to_corners(box_xy, box_wh):
     ])
 
 
-def yolo_loss(args,
-              anchors,
-              num_classes,
-              rescore_confidence=False,
-              print_loss=False):
+def yolo_loss(args, anchors, num_classes):
     """YOLO localization loss function.
 
     Parameters
@@ -178,13 +173,6 @@ def yolo_loss(args,
     num_classes : int
         Number of object classes.
 
-    rescore_confidence : bool, default=False
-        If true then set confidence target to IOU of best predicted box with
-        the closest matching ground truth box.
-
-    print_loss : bool, default=False
-        If True then use a tf.Print() to print the loss components.
-
     Returns
     -------
     mean_loss : float
@@ -192,6 +180,7 @@ def yolo_loss(args,
     """
     (yolo_output, true_boxes, detectors_mask, matching_true_boxes) = args
     num_anchors = len(anchors)
+    # num_classes = K.eval(num_classes)
     object_scale = 5
     no_object_scale = 1
     class_scale = 1
@@ -212,6 +201,12 @@ def yolo_loss(args,
     # TODO: Adjust predictions by image width/height for non-square images?
     # IOUs may be off due to different aspect ratio.
 
+    # Flatten height, width, and anchor dimensions. Add ground truth dimension.
+    # pred_shape = K.shape(pred_xy)
+    # pred_flat_shape = [pred_shape[0], -1, 1, 2]
+    # pred_xy = K.reshape(pred_xy, pred_flat_shape)
+    # pred_wh = K.reshape(pred_wh, pred_flat_shape)
+
     # Expand pred x,y,w,h to allow comparison with ground truth.
     # batch, conv_height, conv_width, num_anchors, num_true_boxes, box_params
     pred_xy = K.expand_dims(pred_xy, 4)
@@ -222,6 +217,9 @@ def yolo_loss(args,
     pred_maxes = pred_xy + pred_wh_half
 
     true_boxes_shape = K.shape(true_boxes)
+
+    # batch, num predictions, num true boxes, box params
+    # true_boxes = K.expand_dims(true_boxes, 1)
 
     # batch, conv_height, conv_width, num_anchors, num_true_boxes, box_params
     true_boxes = K.reshape(true_boxes, [
@@ -256,19 +254,28 @@ def yolo_loss(args,
     # TODO: Darknet region training includes extra coordinate loss for early
     # training steps to encourage predictions to match anchor priors.
 
+    # Is this all unneeded?
+    # top_ious = best_ious * object_detections
+    # best_box_mask = K.equal(iou_scores, best_ious)
+    # true_boxes_best = tf.boolean_mask(true_boxes, best_box_mask)
+    # true_boxes_best = K.reshape(
+    #     true_boxes_best, K.shape(y_pred)[:4] + [K.shape(true_boxes)[-1]])
+
     # Determine confidence weights from object and no_object weights.
     # NOTE: YOLO does not use binary cross-entropy here.
     no_object_weights = (no_object_scale * (1 - object_detections) *
                          (1 - detectors_mask))
     no_objects_loss = no_object_weights * K.square(-pred_confidence)
 
-    if rescore_confidence:
-        objects_loss = (object_scale * detectors_mask *
-                        K.square(best_ious - pred_confidence))
-    else:
-        objects_loss = (object_scale * detectors_mask *
-                        K.square(1 - pred_confidence))
+    # object_weights = object_scale * detectors_mask
+    # rescore = object_detections * best_ious + (1 - object_detections)
+    objects_loss = (object_scale * detectors_mask *
+                    K.square(1 - pred_confidence))
     confidence_loss = objects_loss + no_objects_loss
+
+    # confidence_weights = object_weights + no_object_weights
+    # confidence_loss = (confidence_weights *
+    #                   K.square(detectors_mask * best_ious - pred_confidence))
 
     # Classification loss for matching detections.
     # NOTE: YOLO does not use categorical cross-entropy loss here.
@@ -282,18 +289,8 @@ def yolo_loss(args,
     coordinates_loss = (coordinates_scale * detectors_mask *
                         K.square(matching_boxes - pred_boxes))
 
-    confidence_loss_sum = K.sum(confidence_loss)
-    classification_loss_sum = K.sum(classification_loss)
-    coordinates_loss_sum = K.sum(coordinates_loss)
-    total_loss = 0.5 * (
-        confidence_loss_sum + classification_loss_sum + coordinates_loss_sum)
-    if print_loss:
-        total_loss = tf.Print(
-            total_loss, [
-                total_loss, confidence_loss_sum, classification_loss_sum,
-                coordinates_loss_sum
-            ],
-            message='yolo_loss, conf_loss, class_loss, box_coord_loss:')
+    total_loss = 0.5 * (K.sum(confidence_loss) + K.sum(classification_loss) +
+                        K.sum(coordinates_loss))
 
     return total_loss
 
@@ -356,14 +353,10 @@ def preprocess_true_boxes(true_boxes, anchors, image_size):
     ----------
     true_boxes : array
         List of ground truth boxes in form of relative x, y, w, h, class.
-        Relative coordinates are in the range [0, 1] indicating a percentage
-        of the original image dimensions.
     anchors : array
-        List of anchors in form of w, h.
-        Anchors are assumed to be in the range [0, conv_size] where conv_size
-        is the spatial dimension of the final convolutional features.
+        List of anchors in form of w, h
     image_size : array-like
-        List of image dimensions in form of h, w in pixels.
+        List of image dimensions in form of h, w
 
     Returns
     -------
@@ -377,25 +370,17 @@ def preprocess_true_boxes(true_boxes, anchors, image_size):
     height, width = image_size
     num_anchors = len(anchors)
     # Downsampling factor of 5x 2-stride max_pools == 32.
-    # TODO: Remove hardcoding of downscaling calculations.
     assert height % 32 == 0, 'Image sizes in YOLO_v2 must be multiples of 32.'
     assert width % 32 == 0, 'Image sizes in YOLO_v2 must be multiples of 32.'
     conv_height = height // 32
     conv_width = width // 32
-    num_box_params = true_boxes.shape[1]
-    detectors_mask = np.zeros(
-        (conv_height, conv_width, num_anchors, 1), dtype=np.float32)
-    matching_true_boxes = np.zeros(
-        (conv_height, conv_width, num_anchors, num_box_params),
-        dtype=np.float32)
+    detectors_mask = np.zeros((conv_height, conv_width, num_anchors, 1))
+    matching_true_boxes = np.zeros((conv_height, conv_width, num_anchors, 5))
 
     for box in true_boxes:
-        # scale box to convolutional feature spatial dimensions
-        box_class = box[4:5]
-        box = box[0:4] * np.array(
-            [conv_width, conv_height, conv_width, conv_height])
-        i = np.floor(box[1]).astype('int')
-        j = np.floor(box[0]).astype('int')
+        # box assumed to be relative x, y, w, h
+        i = np.floor(box[1] * conv_height).astype('int')
+        j = np.floor(box[0] * conv_width).astype('int')
         best_iou = 0
         best_anchor = 0
         for k, anchor in enumerate(anchors):
@@ -418,12 +403,10 @@ def preprocess_true_boxes(true_boxes, anchors, image_size):
 
         if best_iou > 0:
             detectors_mask[i, j, best_anchor] = 1
-            adjusted_box = np.array(
-                [
-                    box[0] - j, box[1] - i,
-                    np.log(box[2] / anchors[best_anchor][0]),
-                    np.log(box[3] / anchors[best_anchor][1]), box_class
-                ],
-                dtype=np.float32)
+            adjusted_box = [
+                box[0] * conv_width - j, box[1] * conv_height - i,
+                np.log(box[2] * conv_width / anchors[best_anchor][0]),
+                np.log(box[3] * conv_height / anchors[best_anchor][1]), box[4]
+            ]
             matching_true_boxes[i, j, best_anchor] = adjusted_box
     return detectors_mask, matching_true_boxes
